@@ -163,6 +163,13 @@ class PBIPruner:
                         self.dependencies[key].add((t_ref.strip().strip("'"), f_ref.strip().strip("'")))
 
     def trace_dependencies(self):
+        # 0. Build a global measure map (Measure Name -> Table Name)
+        # In PBI, measures are global, so [M] can refer to a measure in any table.
+        measure_map = {}
+        for table_name, info in self.model_info.items():
+            for m in info['measures']:
+                measure_map[m] = table_name
+
         # 1. Resolve potential_fields into used_fields
         if self.potential_fields:
             self.log(f"Resolving {len(self.potential_fields)} potential fields...")
@@ -174,7 +181,6 @@ class PBIPruner:
         # 2. Structural Protection: Relationship columns and System tables
         self.log("Applying structural protection rules...")
         for table_name, info in self.model_info.items():
-            # Never prune from system tables (Auto Date/Time)
             if table_name.startswith("LocalDateTable_") or table_name.startswith("DateTableTemplate_"):
                 for f in (info['columns'] | info['measures']):
                     self.used_fields.add((table_name, f))
@@ -190,10 +196,20 @@ class PBIPruner:
                     key = (table_name, field)
                     if key in self.used_fields and key in self.dependencies:
                         for dep_key in self.dependencies[key]:
-                            if dep_key not in self.used_fields:
-                                t, f = dep_key
-                                if t in self.model_info and (f in self.model_info[t]['columns'] or f in self.model_info[t]['measures']):
+                            t, f = dep_key
+                            
+                            # RESOLUTION LOGIC:
+                            # If dep_key (t, f) is already fully qualified, check it
+                            if t in self.model_info and (f in self.model_info[t]['columns'] or f in self.model_info[t]['measures']):
+                                if dep_key not in self.used_fields:
                                     self.used_fields.add(dep_key)
+                            # If it was a 'naked' reference [f] and not found in current table t
+                            # check if it's a global measure
+                            elif f in measure_map:
+                                global_dep = (measure_map[f], f)
+                                if global_dep not in self.used_fields:
+                                    self.used_fields.add(global_dep)
+            
             changed = len(self.used_fields) > count_before
 
         self.log(f"Final used fields identified: {len(self.used_fields)}")
