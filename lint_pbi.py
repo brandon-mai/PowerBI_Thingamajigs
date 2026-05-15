@@ -54,25 +54,43 @@ class PBILinter:
             if filename.endswith(".tmdl"):
                 self._lint_tmdl_file(os.path.join(tables_path, filename))
 
-    def _get_sql_fix(self, sql_text, columns, line_content):
-        """Returns (raw_fixed, highlighted_fixed, is_safe)"""
+    def _get_sql_fix(self, original_sql, columns, line_content):
+        """Standardized Two-Version Parsing Strategy."""
         if not columns: return None, None, False
         
+        # 1. Create the Analytic Version (Non-destructive: keeps indices aligned)
+        def mask_m_escape(m): return " " * len(m.group(0))
+        analytic_sql = re.sub(r'#\([^)]+\)', mask_m_escape, original_sql)
+        
+        # 2. Identify Outermost Scope (using Analytic Version)
+        outer_parsing = ""
+        depth = 0
+        for char in analytic_sql:
+            if char == '(': depth += 1
+            elif char == ')': depth -= 1
+            elif depth == 0: outer_parsing += char
+            else: outer_parsing += "_" # Maintain index alignment for outer_parsing too
+            
+        # 3. Detect Outermost SELECT *
+        outer_match = re.search(r'\bSELECT\s+\*', outer_parsing, re.IGNORECASE)
+        if not outer_match: return None, None, False
+        
+        # 4. Generate the Fixed String
         is_redshift = any(word in line_content.lower() for word in ["redshift", "odbc", "postgres"])
         def quote(c): return f'"{c}"' if is_redshift else f'[{c}]'
         
         raw_cols = ", ".join([quote(source_name if source_name else pbi_name) for pbi_name, source_name in columns])
         highlighted_cols = f"{GREEN}{BOLD}{raw_cols}{RESET}"
         
-        matches = list(re.finditer(r'\bSELECT\s+\*', sql_text, re.IGNORECASE))
-        if not matches: return None, None, False
+        # Find the target match in the original string using the analytic index
+        start, end = outer_match.span()
         
-        last_match = matches[-1]
-        remaining = sql_text[last_match.end():].lower()
+        remaining = analytic_sql[end:].lower()
         has_joins = " join " in remaining or "," in remaining
         
-        raw_fixed = sql_text[:last_match.start()] + f"SELECT {raw_cols}" + sql_text[last_match.end():]
-        highlighted_fixed = sql_text[:last_match.start()] + f"SELECT {highlighted_cols}" + sql_text[last_match.end():]
+        raw_fixed = original_sql[:start] + f"SELECT {raw_cols}" + original_sql[end:]
+        highlighted_fixed = original_sql[:start] + f"SELECT {highlighted_cols}" + original_sql[end:]
+        
         return raw_fixed, highlighted_fixed, not has_joins
 
     def _lint_tmdl_file(self, file_path):
@@ -118,7 +136,6 @@ class PBILinter:
             context = f"{current_block_type} [{current_block_name}]"
             new_line = line
 
-            # --- DAX Rules ---
             if current_block_type in ["Measure", "Column"]:
                 if_div_pattern = r'\bIF\s*\(\s*([^,]+)<>\s*0\s*,\s*([^,]+)\/(\1)\s*,\s*BLANK\(\)\s*\)'
                 if re.search(if_div_pattern, line, re.IGNORECASE):
@@ -133,7 +150,6 @@ class PBILinter:
                 if re.search(r'\bCOUNT\s*\(', line, re.IGNORECASE):
                     self.log_warning(filename, context, f"Found {YELLOW}COUNT(){RESET}. Consider {GREEN}COUNTROWS(){RESET}.")
 
-            # --- SQL Rules ---
             if current_block_type == "Partition":
                 sql_patterns = [
                     (r'(Query\s*=\s*")([^"]+)(")', 2),
@@ -144,17 +160,17 @@ class PBILinter:
                     match = re.search(pattern, line, re.IGNORECASE)
                     if match:
                         sql_text = match.group(g_idx)
-                        if re.search(r'SELECT\s+\*', sql_text, re.IGNORECASE):
-                            raw_fixed, highlighted_fixed, is_safe = self._get_sql_fix(sql_text, columns, line)
+                        raw_fixed, highlighted_fixed, is_safe = self._get_sql_fix(sql_text, columns, line)
+                        
+                        if highlighted_fixed:
                             display_suggestion = highlighted_fixed
                             if not is_safe:
                                 display_suggestion += f"\n        {RED}[!] Warning: Joins detected. Verify aliases.{RESET}"
                             else:
                                 display_suggestion += f"\n        {YELLOW}[!] Manual Review Required: Verify sourceColumn names.{RESET}"
-                            
-                            self.log_warning(filename, context, f"SQL {YELLOW}'SELECT *'{RESET} detected.", display_suggestion)
-                            # SQL AUTO-FIX DISABLED FOR SAFETY
-                            # if self.commit and is_safe: ...
+                            self.log_warning(filename, context, f"Top-level {YELLOW}'SELECT *'{RESET} detected.", display_suggestion)
+                        elif re.search(r'SELECT\s+\*', sql_text.replace('#(lf)', ' '), re.IGNORECASE):
+                            self.log_warning(filename, context, f"Subquery {YELLOW}'SELECT *'{RESET} detected. Avoid for better performance.")
 
             new_lines.append(new_line)
 
