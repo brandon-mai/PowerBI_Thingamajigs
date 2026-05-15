@@ -56,7 +56,7 @@ class PBILinter:
                 self._lint_tmdl_file(os.path.join(tables_path, filename))
 
     def _get_sql_fix(self, original_sql, columns, line_content):
-        """Standardized Two-Version Parsing Strategy with Deduplication."""
+        """Standardized Two-Version Parsing Strategy with Accurate Join Detection."""
         if not columns: return None, None, False
         
         # 1. Analytic Version
@@ -70,7 +70,7 @@ class PBILinter:
             if char == '(': depth += 1
             elif char == ')': depth -= 1
             elif depth == 0: outer_parsing += char
-            else: outer_parsing += "_"
+            else: outer_parsing += " "
             
         outer_match = re.search(r'\bSELECT\s+\*', outer_parsing, re.IGNORECASE)
         if not outer_match: return None, None, False
@@ -82,6 +82,7 @@ class PBILinter:
         # 4. Deduplication Logic
         start, end = outer_match.span()
         from_match = re.search(r'\bFROM\b', outer_parsing[end:], re.IGNORECASE)
+        
         select_clause_text = ""
         if from_match:
             select_clause_text = analytic_sql[end : end + from_match.start()]
@@ -96,8 +97,14 @@ class PBILinter:
         col_list = ", ".join(final_cols)
         highlighted_cols = f"{GREEN}{BOLD}{col_list}{RESET}"
         
-        remaining = analytic_sql[end:].lower()
-        has_joins = " join " in remaining or "," in remaining.split("from")[0] if "from" in remaining else False
+        # 5. Accurate Join Detection (Only check outermost FROM clause)
+        has_joins = False
+        if from_match:
+            # We check the part of outer_parsing AFTER the FROM keyword
+            after_from = outer_parsing[end + from_match.end():].lower()
+            # If there's a comma or "JOIN" keyword in the OUTER scope after FROM, it's a join
+            if "," in after_from or " join " in after_from:
+                has_joins = True
         
         raw_fixed = original_sql[:start] + f"SELECT {col_list}" + original_sql[end:]
         highlighted_fixed = original_sql[:start] + f"SELECT {highlighted_cols}" + original_sql[end:]
