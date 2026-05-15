@@ -55,34 +55,47 @@ class PBILinter:
             if filename.endswith(".tmdl"):
                 self._lint_tmdl_file(os.path.join(tables_path, filename))
 
+    def _strip_comments(self, sql):
+        # Strip single line comments
+        sql = re.sub(r'--.*', '', sql)
+        # Strip multi-line comments
+        sql = re.sub(r'/\*.*?\*/', '', sql, flags=re.DOTALL)
+        return sql
+
     def _get_sql_fix(self, original_sql, columns, line_content):
-        """Standardized Two-Version Parsing Strategy with Accurate Join Detection."""
+        """Standardized Two-Version Parsing Strategy with Comment Stripping."""
         if not columns: return None, None, False
         
         # 1. Analytic Version
         def mask_m_escape(m): return " " * len(m.group(0))
         analytic_sql = re.sub(r'#\([^)]+\)', mask_m_escape, original_sql)
         
-        # 2. Outermost Scope Detection
+        # 2. Scope Detection (Must ignore comments for accurate paren counting)
+        # We replace comments with spaces of equal length to maintain indices
+        def mask_comment(m): return " " * len(m.group(0))
+        scope_sql = re.sub(r'--.*', mask_comment, analytic_sql)
+        scope_sql = re.sub(r'/\*.*?\*/', mask_comment, scope_sql, flags=re.DOTALL)
+        
         outer_parsing = ""
         depth = 0
-        for char in analytic_sql:
+        for char in scope_sql:
             if char == '(': depth += 1
             elif char == ')': depth -= 1
             elif depth == 0: outer_parsing += char
             else: outer_parsing += " "
             
-        outer_match = re.search(r'\bSELECT\s+\*', outer_parsing, re.IGNORECASE)
+        # Catch SELECT * and SELECT alias.*
+        star_regex = r'\bSELECT\s+(?:\w+\.)?\*'
+        outer_match = re.search(star_regex, outer_parsing, re.IGNORECASE)
         if not outer_match: return None, None, False
         
         # 3. Provider Detection
         is_redshift = any(word in line_content.lower() for word in ["redshift", "odbc", "postgres"])
         def quote(c): return f'"{c}"' if is_redshift else f'[{c}]'
         
-        # 4. Deduplication Logic
+        # 4. Deduplication
         start, end = outer_match.span()
         from_match = re.search(r'\bFROM\b', outer_parsing[end:], re.IGNORECASE)
-        
         select_clause_text = ""
         if from_match:
             select_clause_text = analytic_sql[end : end + from_match.start()]
@@ -97,12 +110,10 @@ class PBILinter:
         col_list = ", ".join(final_cols)
         highlighted_cols = f"{GREEN}{BOLD}{col_list}{RESET}"
         
-        # 5. Accurate Join Detection (Only check outermost FROM clause)
+        # 5. Join Detection
         has_joins = False
         if from_match:
-            # We check the part of outer_parsing AFTER the FROM keyword
             after_from = outer_parsing[end + from_match.end():].lower()
-            # If there's a comma or "JOIN" keyword in the OUTER scope after FROM, it's a join
             if "," in after_from or " join " in after_from:
                 has_joins = True
         
@@ -116,13 +127,12 @@ class PBILinter:
         with open(file_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
 
-        # Phase 1: Robust Column Inventory
+        # Phase 1: Column Inventory
         columns = [] 
         current_col = None
         for line in lines:
             if re.search(r'^\s*(measure|partition|column|table)\b', line) and not line.strip().startswith("column "):
                 current_col = None
-
             if line.strip().startswith("column "):
                 c_match = re.search(r'^\s+column\s+\'?([^\'=\r\n]+)\'?', line)
                 if c_match and "=" not in line:
@@ -133,7 +143,7 @@ class PBILinter:
                 if s_match and columns and columns[-1][0] == current_col:
                     columns[-1][1] = s_match.group(1).strip()
 
-        # Phase 2: Lint and Fix
+        # Phase 2: Lint
         new_lines = []
         file_modified = False
         current_block_type = "Table"
@@ -167,7 +177,6 @@ class PBILinter:
                         if new_line != line:
                             file_modified = True
                             self.dax_fixes += 1
-                
                 if re.search(r'\bCOUNT\s*\(', line, re.IGNORECASE):
                     self.log_warning(filename, context, f"Found {YELLOW}COUNT(){RESET}. Consider {GREEN}COUNTROWS(){RESET}.")
 
@@ -196,8 +205,15 @@ class PBILinter:
                                 if new_line != line:
                                     file_modified = True
                                     self.sql_fixes += 1
-                        elif re.search(r'SELECT\s+\*', sql_text.replace('#(lf)', ' '), re.IGNORECASE):
-                            self.log_warning(filename, context, f"Subquery {YELLOW}'SELECT *'{RESET} detected. Avoid for better performance.")
+                        
+                        # Subquery Check: Now independent of Top-level result
+                        clean_sql = self._strip_comments(sql_text.replace('#(lf)', ' '))
+                        if re.search(r'\bSELECT\s+(?:\w+\.)?\*', clean_sql, re.IGNORECASE):
+                            # Only warn about subquery if it's not the one we just fixed at top level
+                            # A simple check: if Top-level fix was NOT found, or if multiple exist
+                            star_count = len(re.findall(r'\bSELECT\s+(?:\w+\.)?\*', clean_sql, re.IGNORECASE))
+                            if not highlighted_fixed or star_count > 1:
+                                self.log_warning(filename, context, f"Subquery {YELLOW}'SELECT *'{RESET} detected. Avoid for better performance.")
 
             new_lines.append(new_line)
 
