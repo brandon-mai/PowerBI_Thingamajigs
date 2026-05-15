@@ -55,34 +55,33 @@ class PBILinter:
                 self._lint_tmdl_file(os.path.join(tables_path, filename))
 
     def _get_sql_fix(self, sql_text, columns, line_content):
-        """Returns (fixed_sql, is_safe_to_commit)"""
-        if not columns: return None, False
+        """Returns (raw_fixed, highlighted_fixed, is_safe)"""
+        if not columns: return None, None, False
         
-        # Detect quoting style
         is_redshift = any(word in line_content.lower() for word in ["redshift", "odbc", "postgres"])
         def quote(c): return f'"{c}"' if is_redshift else f'[{c}]'
         
-        # Use the sourceColumn mapping if available
-        # Columns is a list of (pbi_name, source_name)
-        col_list = ", ".join([quote(source_name if source_name else pbi_name) for pbi_name, source_name in columns])
+        raw_cols = ", ".join([quote(source_name if source_name else pbi_name) for pbi_name, source_name in columns])
+        highlighted_cols = f"{GREEN}{BOLD}{raw_cols}{RESET}"
         
         matches = list(re.finditer(r'\bSELECT\s+\*', sql_text, re.IGNORECASE))
-        if not matches: return None, False
+        if not matches: return None, None, False
         
         last_match = matches[-1]
         remaining = sql_text[last_match.end():].lower()
         has_joins = " join " in remaining or "," in remaining
         
-        fixed = sql_text[:last_match.start()] + f"SELECT {col_list}" + sql_text[last_match.end():]
-        return fixed, not has_joins
+        raw_fixed = sql_text[:last_match.start()] + f"SELECT {raw_cols}" + sql_text[last_match.end():]
+        highlighted_fixed = sql_text[:last_match.start()] + f"SELECT {highlighted_cols}" + sql_text[last_match.end():]
+        return raw_fixed, highlighted_fixed, not has_joins
 
     def _lint_tmdl_file(self, file_path):
         filename = os.path.basename(file_path)
         with open(file_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
 
-        # Phase 1: Inventory columns with their source mapping
-        columns = [] # List of (pbi_name, source_name)
+        # Phase 1: Inventory columns
+        columns = [] 
         current_col = None
         for line in lines:
             if line.strip().startswith("column "):
@@ -123,8 +122,8 @@ class PBILinter:
             if current_block_type in ["Measure", "Column"]:
                 if_div_pattern = r'\bIF\s*\(\s*([^,]+)<>\s*0\s*,\s*([^,]+)\/(\1)\s*,\s*BLANK\(\)\s*\)'
                 if re.search(if_div_pattern, line, re.IGNORECASE):
-                    fix_expr = re.sub(if_div_pattern, r'DIVIDE(\2, \1)', line, flags=re.IGNORECASE).strip()
-                    self.log_warning(filename, context, f"IF division detected. Suggest {GREEN}DIVIDE(){RESET}.", fix_expr)
+                    highlighted_fix = re.sub(if_div_pattern, f'{GREEN}{BOLD}DIVIDE(\\2, \\1){RESET}', line, flags=re.IGNORECASE).strip()
+                    self.log_warning(filename, context, f"IF division detected. Suggest {GREEN}DIVIDE(){RESET}.", highlighted_fix)
                     if self.commit:
                         new_line = re.sub(if_div_pattern, r'DIVIDE(\2, \1)', line, flags=re.IGNORECASE)
                         if new_line != line:
@@ -146,8 +145,8 @@ class PBILinter:
                     if match:
                         sql_text = match.group(g_idx)
                         if re.search(r'SELECT\s+\*', sql_text, re.IGNORECASE):
-                            fixed_sql, is_safe = self._get_sql_fix(sql_text, columns, line)
-                            display_suggestion = fixed_sql
+                            raw_fixed, highlighted_fixed, is_safe = self._get_sql_fix(sql_text, columns, line)
+                            display_suggestion = highlighted_fixed
                             if not is_safe:
                                 display_suggestion += f"\n        {RED}[!] Warning: Joins detected. Verify aliases.{RESET}"
                             else:
@@ -186,7 +185,7 @@ class PBILinter:
                     last_file = w['file']
                 print(f"  {YELLOW}[WRN]{RESET} {BOLD}{w['context']}{RESET}: {w['message']}")
                 if w['suggestion']:
-                    print(f"        {GREEN}Suggestion:{RESET} {w['suggestion'].strip()}\n")
+                    print(f"        {CYAN}Suggestion:{RESET} {w['suggestion'].strip()}\n")
         
         print(f"\n{BOLD}{CYAN}{'='*40}{RESET}")
         print(f"{BOLD}Total Warnings: {len(self.warnings)}{RESET}")
