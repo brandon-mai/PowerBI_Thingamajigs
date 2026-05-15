@@ -3,6 +3,14 @@ import json
 import re
 import sys
 
+# ANSI Colors for terminal output
+YELLOW = "\033[93m"
+RED = "\033[91m"
+GREEN = "\033[92m"
+CYAN = "\033[96m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
 class PBIPruner:
     def __init__(self, root_path, dry_run=True):
         self.root_path = os.path.abspath(root_path)
@@ -14,9 +22,13 @@ class PBIPruner:
         self.relationship_blocks = []
         self.report_path = ""
         self.semantic_model_path = ""
+        self.pruned_count = 0
 
-    def log(self, msg):
-        print(f"\033[34m[INFO]\033[0m {msg}")
+    def log(self, msg, level="INFO"):
+        color = CYAN if level == "INFO" else YELLOW
+        if level == "PRUNE": color = RED
+        if level == "DONE": color = GREEN
+        print(f"{color}[{level}]{RESET} {msg}")
 
     def find_paths(self):
         for item in os.listdir(self.root_path):
@@ -189,7 +201,7 @@ class PBIPruner:
                     self._remove_table_ref(table_name)
             else:
                 self._prune_table_file(info['file_path'], table_name)
-
+    
     def _prune_relationships(self, used_rel_ids):
         rel_path = os.path.join(self.semantic_model_path, "definition", "relationships.tmdl")
         if not os.path.exists(rel_path): return
@@ -199,7 +211,9 @@ class PBIPruner:
                 f.write("\n".join(new_blocks))
         else:
             for rel in self.relationship_blocks:
-                if rel['id'] not in used_rel_ids: self.log(f"Pruning Relationship: {rel['from'][0]} -> {rel['to'][0]}")
+                if rel['id'] not in used_rel_ids:
+                    self.log(f"Relationship: {rel['from'][0]} -> {rel['to'][0]}", "PRUNE")
+                    self.pruned_count += 1
 
     def _prune_table_file(self, file_path, table_name):
         with open(file_path, 'r', encoding='utf-8') as f: lines = f.readlines()
@@ -221,7 +235,10 @@ class PBIPruner:
             elif m_match: field_name = m_match.group(1).strip().strip("'")
             elif h_match: field_name = h_match.group(1).strip().strip("'")
             if field_name and (table_name, field_name) not in self.used_fields:
-                self.log(f"Pruning: {table_name}[{field_name}]"); skip_until_indent = indent; continue
+                self.log(f"{table_name}[{field_name}]", "PRUNE")
+                self.pruned_count += 1
+                skip_until_indent = indent
+                continue
             new_lines.append(line)
         if not self.dry_run:
             with open(file_path, 'w', encoding='utf-8') as f: f.writelines(new_lines)
@@ -234,18 +251,31 @@ class PBIPruner:
         with open(model_tmdl, 'w', encoding='utf-8') as f: f.writelines(new_lines)
 
     def run(self):
+        if os.name == 'nt': os.system('') # Enable colors
+        print(f"\n{BOLD}{CYAN}=== POWER BI MODEL PRUNER ==={RESET}")
+        print(f"{BOLD}Path:{RESET} {self.root_path}")
+        if self.dry_run: print(f"{YELLOW}[DRY RUN MODE]{RESET} No files will be modified.\n")
+        else: print(f"{RED}[COMMIT MODE]{RESET} Files will be modified permanently.\n")
+        
         self.find_paths()
-        if not self.report_path or not self.semantic_model_path: return
+        if not self.report_path or not self.semantic_model_path:
+            self.log("Could not find Report or SemanticModel folders.", "ERROR")
+            return
+            
         self.scan_report_usage()
         self.scan_model_metadata()
         self.trace_dependencies()
         self.prune()
-        self.log("Done.")
+        
+        print(f"\n{BOLD}{GREEN}=== PRUNING COMPLETE ==={RESET}")
+        print(f"{BOLD}Total Fields/Relationships Pruned:{RESET} {self.pruned_count}")
+        if self.dry_run: print(f"Run with {BOLD}--commit{RESET} to apply these changes.")
+        print(f"{BOLD}{CYAN}{'='*36}{RESET}\n")
 
 if __name__ == "__main__":
     path = sys.argv[1] if len(sys.argv) > 1 else "."
-    dry = "--run" not in sys.argv
-    if dry: 
+    commit = "--commit" in sys.argv
+    if not commit: 
         print("=== DRY RUN MODE ===")
-        print("To apply changes, use --run flag.")
-    PBIPruner(path, dry_run=dry).run()
+        print("To apply changes, use --commit flag.")
+    PBIPruner(path, dry_run=not commit).run()
