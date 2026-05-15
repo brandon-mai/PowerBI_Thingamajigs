@@ -11,9 +11,10 @@ BOLD = "\033[1m"
 RESET = "\033[0m"
 
 class PBILinter:
-    def __init__(self, project_path, commit=False):
+    def __init__(self, project_path, commit=False, commit_sql=False):
         self.project_path = project_path
         self.commit = commit
+        self.commit_sql = commit_sql
         self.semantic_model_dir = self._find_semantic_model(project_path)
         self.warnings = []
         self.dax_fixes = 0
@@ -55,40 +56,50 @@ class PBILinter:
                 self._lint_tmdl_file(os.path.join(tables_path, filename))
 
     def _get_sql_fix(self, original_sql, columns, line_content):
-        """Standardized Two-Version Parsing Strategy."""
+        """Standardized Two-Version Parsing Strategy with Deduplication."""
         if not columns: return None, None, False
         
-        # 1. Create the Analytic Version (Non-destructive: keeps indices aligned)
+        # 1. Analytic Version
         def mask_m_escape(m): return " " * len(m.group(0))
         analytic_sql = re.sub(r'#\([^)]+\)', mask_m_escape, original_sql)
         
-        # 2. Identify Outermost Scope (using Analytic Version)
+        # 2. Outermost Scope Detection
         outer_parsing = ""
         depth = 0
         for char in analytic_sql:
             if char == '(': depth += 1
             elif char == ')': depth -= 1
             elif depth == 0: outer_parsing += char
-            else: outer_parsing += "_" # Maintain index alignment for outer_parsing too
+            else: outer_parsing += "_"
             
-        # 3. Detect Outermost SELECT *
         outer_match = re.search(r'\bSELECT\s+\*', outer_parsing, re.IGNORECASE)
         if not outer_match: return None, None, False
         
-        # 4. Generate the Fixed String
+        # 3. Provider Detection
         is_redshift = any(word in line_content.lower() for word in ["redshift", "odbc", "postgres"])
         def quote(c): return f'"{c}"' if is_redshift else f'[{c}]'
         
-        raw_cols = ", ".join([quote(source_name if source_name else pbi_name) for pbi_name, source_name in columns])
-        highlighted_cols = f"{GREEN}{BOLD}{raw_cols}{RESET}"
-        
-        # Find the target match in the original string using the analytic index
+        # 4. Deduplication Logic
         start, end = outer_match.span()
+        from_match = re.search(r'\bFROM\b', outer_parsing[end:], re.IGNORECASE)
+        select_clause_text = ""
+        if from_match:
+            select_clause_text = analytic_sql[end : end + from_match.start()]
+            
+        final_cols = []
+        for pbi_name, source_name in columns:
+            db_name = source_name if source_name else pbi_name
+            if re.search(fr'\b{re.escape(db_name)}\b', select_clause_text, re.IGNORECASE):
+                continue
+            final_cols.append(quote(db_name))
+        
+        col_list = ", ".join(final_cols)
+        highlighted_cols = f"{GREEN}{BOLD}{col_list}{RESET}"
         
         remaining = analytic_sql[end:].lower()
-        has_joins = " join " in remaining or "," in remaining
+        has_joins = " join " in remaining or "," in remaining.split("from")[0] if "from" in remaining else False
         
-        raw_fixed = original_sql[:start] + f"SELECT {raw_cols}" + original_sql[end:]
+        raw_fixed = original_sql[:start] + f"SELECT {col_list}" + original_sql[end:]
         highlighted_fixed = original_sql[:start] + f"SELECT {highlighted_cols}" + original_sql[end:]
         
         return raw_fixed, highlighted_fixed, not has_joins
@@ -98,10 +109,13 @@ class PBILinter:
         with open(file_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
 
-        # Phase 1: Inventory columns
+        # Phase 1: Robust Column Inventory
         columns = [] 
         current_col = None
         for line in lines:
+            if re.search(r'^\s*(measure|partition|column|table)\b', line) and not line.strip().startswith("column "):
+                current_col = None
+
             if line.strip().startswith("column "):
                 c_match = re.search(r'^\s+column\s+\'?([^\'=\r\n]+)\'?', line)
                 if c_match and "=" not in line:
@@ -109,7 +123,7 @@ class PBILinter:
                     columns.append([current_col, None])
             elif "sourceColumn:" in line and current_col:
                 s_match = re.search(r'sourceColumn:\s*(.*)', line)
-                if s_match:
+                if s_match and columns and columns[-1][0] == current_col:
                     columns[-1][1] = s_match.group(1).strip()
 
         # Phase 2: Lint and Fix
@@ -169,6 +183,12 @@ class PBILinter:
                             else:
                                 display_suggestion += f"\n        {YELLOW}[!] Manual Review Required: Verify sourceColumn names.{RESET}"
                             self.log_warning(filename, context, f"Top-level {YELLOW}'SELECT *'{RESET} detected.", display_suggestion)
+                            
+                            if self.commit and self.commit_sql and is_safe:
+                                new_line = line[:match.start(g_idx)] + raw_fixed + line[match.end(g_idx):]
+                                if new_line != line:
+                                    file_modified = True
+                                    self.sql_fixes += 1
                         elif re.search(r'SELECT\s+\*', sql_text.replace('#(lf)', ' '), re.IGNORECASE):
                             self.log_warning(filename, context, f"Subquery {YELLOW}'SELECT *'{RESET} detected. Avoid for better performance.")
 
@@ -188,8 +208,12 @@ class PBILinter:
     def _print_report(self):
         print(f"\n{BOLD}{CYAN}=== POWER BI LINT REPORT ==={RESET}")
         print(f"{BOLD}Project:{RESET} {os.path.basename(self.semantic_model_dir)}")
-        if self.commit: print(f"{GREEN}[COMMIT MODE]{RESET} Applying safe auto-fixes to DAX.\n")
-        else: print(f"{YELLOW}[DRY RUN MODE]{RESET} No changes saved. Use {BOLD}--commit{RESET} to fix.\n")
+        if self.commit:
+            mode_msg = "DAX fixes applied."
+            if self.commit_sql: mode_msg = "DAX and safe SQL fixes applied."
+            print(f"{GREEN}[COMMIT MODE]{RESET} {mode_msg}\n")
+        else:
+            print(f"{YELLOW}[DRY RUN MODE]{RESET} No changes saved. Use {BOLD}--commit{RESET} to fix.\n")
         
         if not self.warnings: print(f"{GREEN}[OK]{RESET} No issues found!")
         else:
@@ -207,11 +231,15 @@ class PBILinter:
         print(f"{BOLD}Total Warnings: {len(self.warnings)}{RESET}")
         if self.commit:
             print(f"{BOLD}DAX Fixes Applied: {self.dax_fixes}{RESET}")
-            print(f"{YELLOW}SQL Fixes (Auto-commit disabled for safety){RESET}")
+            if self.commit_sql:
+                print(f"{BOLD}SQL Fixes Applied: {self.sql_fixes}{RESET}")
+            else:
+                print(f"{YELLOW}SQL Fixes (Use --sql to commit safe fixes){RESET}")
         print()
 
 if __name__ == "__main__":
     if os.name == 'nt': os.system('')
     path = sys.argv[1] if len(sys.argv) > 1 else "."
     commit = "--commit" in sys.argv
-    PBILinter(path, commit=commit).lint()
+    commit_sql = "--sql" in sys.argv
+    PBILinter(path, commit=commit, commit_sql=commit_sql).lint()
